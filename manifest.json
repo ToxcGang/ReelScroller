@@ -7,7 +7,8 @@
     "storage",
     "tabs",
     "activeTab",
-    "https://www.instagram.com/*"
+    "*://instagram.com/*",
+    "*://*.instagram.com/*"
   ],
   "background": {
     "scripts": ["background.js"],
@@ -16,23 +17,26 @@
   "browser_action": {
     "default_title": "Reel Scroller",
     "default_icon": {
-      "48": "icons/icon-48.png"
+      "48": "icon-48.png"
     }
   },
   "content_scripts": [
     {
-      "matches": ["*://www.instagram.com/*"],
-      "js": ["content_script.js"],
+      "matches": ["*://instagram.com/*", "*://*.instagram.com/*"],
+      "js": ["content_script_clean.js"],
       "run_at": "document_idle"
     }
   ],
   "icons": {
-    "48": "icons/icon-48.png"
+    "48": "icon-48.png"
   },
   "browser_specific_settings": {
     "gecko": {
       "id": "reelscroller@example.com",
-      "strict_min_version": "91.0"
+      "strict_min_version": "140.0"
+    },
+    "gecko_android": {
+      "strict_min_version": "142.0"
     }
   }
 }
