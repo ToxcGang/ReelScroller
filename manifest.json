@@ -1,0 +1,38 @@
+{
+  "manifest_version": 2,
+  "name": "Reel Scroller (Instagram Auto-Scroll)",
+  "version": "0.1.1",
+  "description": "Automatically scroll Instagram Reels to the next one when the current video ends. Toggle with the toolbar button.",
+  "permissions": [
+    "storage",
+    "tabs",
+    "activeTab",
+    "https://www.instagram.com/*"
+  ],
+  "background": {
+    "scripts": ["background.js"],
+    "persistent": false
+  },
+  "browser_action": {
+    "default_title": "Reel Scroller",
+    "default_icon": {
+      "48": "icons/icon-48.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://www.instagram.com/*"],
+      "js": ["content_script.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "48": "icons/icon-48.png"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "reelscroller@example.com",
+      "strict_min_version": "91.0"
+    }
+  }
+}
