@@ -12,23 +12,7 @@ Minimal overhead with no unnecessary tracking or bloat.
 🔒 Privacy-friendly
 No data collection, no external requests—everything runs locally.
 
-📦 Installation
-Option 1: Temporary (for development/testing)
-Open Firefox
-Go to about:debugging#/runtime/this-firefox
-Click "Load Temporary Add-on"
-Select your manifest.json file
-Option 2: Permanent (manual install)
-Package the extension into a .zip
-Rename it to .xpi
-Install via Firefox or distribute it
 
-🧪 Development
-To modify or improve:
-Clone the repo
-Make changes to content.js
-Reload extension in about:debugging
-Test on Instagram Reels
 
 🤝 Contributing
 Contributions are welcome!
