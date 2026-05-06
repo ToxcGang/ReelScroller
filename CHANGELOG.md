@@ -2,6 +2,13 @@
 
 All notable changes to Reel Scroller are documented here.
 
+## 0.2.1 - 2026-05-06
+
+### Fixed
+
+- Added support for Instagram Reels ads labeled with a short visible `Ad` span.
+- Improved ad detection by scanning visible nearby label elements around the active Reel.
+
 ## 0.2.0 - 2026-05-06
 
 ### Changed
