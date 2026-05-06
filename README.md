@@ -5,7 +5,7 @@ Reel Scroller is a Firefox extension that automatically advances Instagram Reels
 ## Features
 
 - Auto-scrolls to the next Instagram Reel when the current Reel finishes.
-- Skips Reels that show visible sponsored labels such as `Sponsored`, `Paid promotion`, or `Advertisement`.
+- Skips Reels that show visible ad labels such as `Ad`, `Sponsored`, `Paid promotion`, or `Advertisement`.
 - Uses one global toolbar toggle across Instagram tabs.
 - Starts enabled by default.
 - Stores only the on/off preference in Firefox extension storage.
@@ -31,7 +31,7 @@ Temporary add-ons are removed when Firefox restarts. Reload the extension from `
 
 The background script stores a single global setting named `reelScrollerEnabled`. It sends `ENABLE` and `DISABLE` messages to Instagram tabs whenever the toolbar button is clicked or an Instagram tab finishes loading.
 
-The content script runs on Instagram pages, but only attaches scrolling behavior on `/reel/` and `/reels/` routes. It watches visible video elements, scrolls after the focused video ends, and checks nearby visible text for sponsored labels.
+The content script runs on Instagram pages, but only attaches scrolling behavior on `/reel/` and `/reels/` routes. It watches visible video elements, scrolls after the focused video ends, and checks nearby visible text for ad labels.
 
 ## Troubleshooting
 
