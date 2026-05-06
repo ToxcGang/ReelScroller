@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Reel Scroller (Instagram Auto-Scroll)",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Automatically scroll Instagram Reels, skip sponsored Reels, and toggle globally from the toolbar.",
   "permissions": [
     "storage",
