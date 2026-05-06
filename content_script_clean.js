@@ -1,372 +1,463 @@
-// Content script for Instagram Reels auto-scrolling
-// Behavior: when enabled, listen for the end of the currently visible video and scroll to the next one, then autoplay it.
+// Content script for Instagram Reels auto-scrolling.
+// It scrolls when the focused Reel ends and skips Reels with visible sponsored labels.
 
 (() => {
+  const CONTROLLER_KEY = '__reelScrollerController';
+  const ENABLED_KEY = 'reelScrollerEnabled';
+  const SPONSORED_LABEL_RE = /\b(sponsored|paid partnership|paid promotion|advertisement)\b/i;
+
+  if (window[CONTROLLER_KEY]){
+    window[CONTROLLER_KEY].initFromStorage();
+    return;
+  }
+
   let enabled = false;
   let observer = null;
-  let adCheckInterval = null;
+  let syncInterval = null;
+  let lastSkipAt = 0;
+  let skipCooldownUntil = 0;
+  const attachedVideos = new Set();
+  const cleanupByVideo = new WeakMap();
 
   function log(...args){
     console.log('[ReelScroller]', ...args);
   }
 
-  function getAllVideos(){
-    return Array.from(document.querySelectorAll('video')).filter(v => v && v.offsetParent !== null);
+  function isReelsPage(){
+    return /^\/reels?(\/|$)/.test(window.location.pathname);
   }
 
-  function videoCenterDistance(video){
-    const r = video.getBoundingClientRect();
-    const videoCenter = (r.top + r.bottom) / 2;
-    const screenCenter = window.innerHeight / 2;
-    return Math.abs(videoCenter - screenCenter);
+  function normalizeText(value){
+    return (value || '').toString().replace(/\s+/g, ' ').trim();
   }
 
-  function findFocusedVideo(){
-    const vids = getAllVideos();
-    if (vids.length === 0) return null;
-    vids.sort((a,b) => videoCenterDistance(a) - videoCenterDistance(b));
-    return vids[0];
+  function textHasSponsoredSignal(value){
+    const text = normalizeText(value);
+    return text.length > 0 && text.length <= 100 && SPONSORED_LABEL_RE.test(text);
   }
 
-  function findNextVideo(current){
-    const vids = getAllVideos().sort((a,b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
-    const idx = vids.indexOf(current);
-    if (idx === -1) return vids[0] || null;
-    return vids[idx+1] || null;
+  function rectArea(rect){
+    return Math.max(0, rect.width) * Math.max(0, rect.height);
   }
 
-  // Heuristics to detect ad/sponsored overlays near a video
-  // contextRect (optional) — if provided, require matched anchors/elements to overlap this rect.
-  function isAdElement(el, contextRect){
-    if (!el) return false;
-    try{
-      const style = window.getComputedStyle && window.getComputedStyle(el);
-      if (style && (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity || '1') === 0)) return false;
-    } catch(e){}
-
-    // Strong textual indicators
-    try{
-      const text = (el.innerText || el.textContent || '').toString().toLowerCase().trim();
-      const adRegex = /sponsored|paid partnership|paid promotion|advertisement|promoted|sponsored by|sponsor/;
-      if (adRegex.test(text)) return true;
-    } catch(e){}
-
-    // aria/title/alt
-    try{
-      const aria = (el.getAttribute && (el.getAttribute('aria-label') || el.getAttribute('aria-labelledby') || el.getAttribute('title') || el.getAttribute('alt') || '')) || '';
-      if (aria && /sponsored|sponsor|promoted/i.test(aria)) return true;
-    } catch(e){}
-
-    // class tokens
-    try{
-      if (el.classList){
-        for (const t of el.classList){
-          const tt = t.toString().toLowerCase();
-          if (tt === 'sponsored' || tt === 'sponsor' || tt === 'promoted') return true;
-        }
-      }
-    } catch(e){}
-
-    // data attributes and image alts
-    try{
-      const dataTest = (el.getAttribute && (el.getAttribute('data-testid') || el.getAttribute('data-sponsor') || el.getAttribute('data-sponsored') || '')) || '';
-      if (dataTest && /sponsor|sponsored/i.test(dataTest)) return true;
-    } catch(e){}
-    try{
-      const imgs = el.querySelectorAll && el.querySelectorAll('img, svg');
-      if (imgs && imgs.length){
-        for (let k=0;k<imgs.length;k++){
-          const alt = (imgs[k].getAttribute('alt') || imgs[k].getAttribute('title') || '').toString().toLowerCase();
-          if (alt && /sponsored|promotion|paid/i.test(alt)) return true;
-        }
-      }
-    } catch(e){}
-
-    // Strict Facebook ad/link detection using URL parsing (only treat clear clickthroughs)
-    try{
-      function hrefLooksLikeFacebookAd(h){
-        if (!h) return false;
-        try{
-          const url = new URL(h, location.href);
-          const host = url.hostname.toLowerCase();
-          const path = (url.pathname || '').toLowerCase();
-          // Redirector used for clicks
-          if (host === 'l.facebook.com' && path.startsWith('/l.php')) return true;
-          // facebook.com with a path segment exactly 'ads'
-          const segments = path.split('/').filter(Boolean);
-          if ((host === 'facebook.com' || host.endsWith('.facebook.com')) && segments.includes('ads')) return true;
-          // query params common with ad clickthroughs
-          const qp = url.searchParams;
-          if (qp && (qp.has('ad_id') || qp.has('ad_click_id'))) return true;
-        } catch(e){}
-        return false;
-      }
-
-      // For anchors, require visible bounding rect and overlap with contextRect (if provided)
-      if (el.tagName && el.tagName.toLowerCase() === 'a'){
-        const h = el.getAttribute('href') || '';
-        if (h && hrefLooksLikeFacebookAd(h)){
-          try{
-            const er = el.getBoundingClientRect();
-            if (er.width <= 0 || er.height <= 0) return false;
-            if (contextRect){
-              const ix = Math.max(0, Math.min(er.right, contextRect.right) - Math.max(er.left, contextRect.left));
-              const iy = Math.max(0, Math.min(er.bottom, contextRect.bottom) - Math.max(er.top, contextRect.top));
-              if (ix * iy <= 0) return false;
-            }
-          } catch(e){}
-          log('isAdElement: anchor href matches facebook ad', h.slice(0,120));
-          return true;
-        }
-      }
-
-      if (el.querySelectorAll){
-        const anchors = el.querySelectorAll('a[href]');
-        for (let i=0;i<anchors.length && i<20;i++){
-          try{
-            const href = anchors[i].getAttribute('href') || '';
-            const dataHref = anchors[i].getAttribute('data-href') || anchors[i].getAttribute('data-url') || '';
-            if ((href && hrefLooksLikeFacebookAd(href)) || (dataHref && hrefLooksLikeFacebookAd(dataHref))){
-              try{
-                const ar = anchors[i].getBoundingClientRect();
-                if (ar.width <= 0 || ar.height <= 0) continue;
-                if (contextRect){
-                  const ix = Math.max(0, Math.min(ar.right, contextRect.right) - Math.max(ar.left, contextRect.left));
-                  const iy = Math.max(0, Math.min(ar.bottom, contextRect.bottom) - Math.max(ar.top, contextRect.top));
-                  if (ix * iy <= 0) continue;
-                }
-              } catch(e){}
-              log('isAdElement: descendant anchor matches facebook ad', href.slice(0,120), dataHref.slice(0,120));
-              return true;
-            }
-          } catch(e){}
-        }
-      }
-    } catch(e){}
-
-    return false;
+  function rectsIntersect(a, b){
+    return Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left)) *
+      Math.max(0, Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top)) > 0;
   }
 
-  function detectAdNearby(video){
-    if (!video) return false;
-    const rect = video.getBoundingClientRect();
-    try{
-      const points = [
-        {x: rect.left + rect.width/2, y: rect.top + rect.height/2},
-        {x: rect.left + rect.width/2, y: rect.top + 5},
-        {x: rect.left + rect.width/2, y: rect.bottom - 5},
-        {x: rect.left + 5, y: rect.top + rect.height/2},
-        {x: rect.right - 5, y: rect.top + rect.height/2}
-      ];
-      for (const p of points){
-        if (p.x < 0 || p.y < 0 || p.x > window.innerWidth || p.y > window.innerHeight) continue;
-        const elems = document.elementsFromPoint(p.x, p.y);
-        if (!elems || !elems.length) continue;
-        for (const el of elems){
-          if (isAdElement(el, rect)){
-            try{
-              const er = el.getBoundingClientRect();
-              const ix = Math.max(0, Math.min(er.right, rect.right) - Math.max(er.left, rect.left));
-              const iy = Math.max(0, Math.min(er.bottom, rect.bottom) - Math.max(er.top, rect.top));
-              const interArea = ix * iy;
-              const focusedArea = (rect.width * rect.height) || 1;
-              if (interArea > 0 && (interArea > focusedArea * 0.005 || er.width < rect.width * 0.9)){
-                log('detectAdNearby: matched element', el, (el.innerText||'').slice(0,80));
-                return true;
-              }
-            } catch(e){}
-          }
-          let a = el;
-          for (let i=0;i<5 && a; i++){
-            try{
-              if (isAdElement(a, rect)){
-                const ar = a.getBoundingClientRect();
-                const ix = Math.max(0, Math.min(ar.right, rect.right) - Math.max(ar.left, rect.left));
-                const iy = Math.max(0, Math.min(ar.bottom, rect.bottom) - Math.max(ar.top, rect.top));
-                if (ix * iy > 0){ log('detectAdNearby: matched ancestor', a); return true; }
-              }
-            } catch(e){}
-            a = a.parentElement;
-          }
-        }
-      }
-    } catch(e){}
-
-    let el = video;
-    for (let i=0;i<6 && el; i++){
-      try{
-        if (isAdElement(el, rect)) return true;
-        const kids = el.querySelectorAll && el.querySelectorAll(':scope > *');
-        if (kids && kids.length){
-          for (let j=0;j<kids.length;j++){
-            try{
-              if (isAdElement(kids[j], rect)){
-                const kr = kids[j].getBoundingClientRect();
-                const ix = Math.max(0, Math.min(kr.right, rect.right) - Math.max(kr.left, rect.left));
-                const iy = Math.max(0, Math.min(kr.bottom, rect.bottom) - Math.max(kr.top, rect.top));
-                if (ix * iy > 0) return true;
-              }
-            } catch(e){}
-          }
-        }
-      } catch(e){}
-      el = el.parentElement;
-    }
-    return false;
-  }
-
-  function attachEndedListener(video){
-    if (!video) return;
-    if (video.__rs_attached) return;
-    video.__rs_attached = true;
-    video.addEventListener('ended', onVideoEnded);
-
-    let lastCheck = 0;
-    function onTimeUpdate(){
-      if (video.duration && video.currentTime){
-        if (video.duration - video.currentTime < 0.25){
-          log('timeupdate near-end', video.currentTime, '/', video.duration, video);
-          onVideoEnded({target: video, type: 'timeupdate'});
-        }
-      }
-      lastCheck = Date.now();
-    }
-    video.addEventListener('timeupdate', onTimeUpdate);
-
-    video.__rs_cleanup = () => {
-      try { video.removeEventListener('ended', onVideoEnded); } catch(e){}
-      try { video.removeEventListener('timeupdate', onTimeUpdate); } catch(e){}
-      video.__rs_attached = false;
-      video.__rs_cleanup = null;
+  function expandRect(rect, horizontal, vertical){
+    return {
+      left: Math.max(0, rect.left - horizontal),
+      right: Math.min(window.innerWidth, rect.right + horizontal),
+      top: Math.max(0, rect.top - vertical),
+      bottom: Math.min(window.innerHeight, rect.bottom + vertical),
+      width: Math.min(window.innerWidth, rect.right + horizontal) - Math.max(0, rect.left - horizontal),
+      height: Math.min(window.innerHeight, rect.bottom + vertical) - Math.max(0, rect.top - vertical)
     };
   }
 
-  function detachAll(){
-    const vids = document.querySelectorAll('video');
-    vids.forEach(v => {
-      if (v.__rs_cleanup) v.__rs_cleanup();
-    });
+  function isElementVisible(el){
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+
+    let rect;
+    try {
+      rect = el.getBoundingClientRect();
+    } catch (e) {
+      return false;
+    }
+
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    if (rect.bottom < 0 || rect.top > window.innerHeight || rect.right < 0 || rect.left > window.innerWidth) return false;
+
+    try {
+      const style = window.getComputedStyle(el);
+      if (!style) return true;
+      if (style.display === 'none' || style.visibility === 'hidden') return false;
+      if (parseFloat(style.opacity || '1') === 0) return false;
+    } catch (e) {
+      return true;
+    }
+
+    return true;
   }
 
-  let lastHandling = 0;
-  let skipCooldownUntil = 0;
+  function isUsableVideo(video){
+    if (!video || video.nodeType !== Node.ELEMENT_NODE) return false;
+    try {
+      const rect = video.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    } catch (e) {
+      return false;
+    }
+  }
 
-  function onVideoEnded(e){
+  function getVideos(){
+    return Array.from(document.querySelectorAll('video')).filter(isUsableVideo);
+  }
+
+  function isInViewport(video){
+    const rect = video.getBoundingClientRect();
+    return rect.bottom > 0 && rect.top < window.innerHeight && rect.right > 0 && rect.left < window.innerWidth;
+  }
+
+  function videoCenterDistance(video){
+    const rect = video.getBoundingClientRect();
+    const videoCenter = (rect.top + rect.bottom) / 2;
+    return Math.abs(videoCenter - window.innerHeight / 2);
+  }
+
+  function findFocusedVideo(){
+    const videos = getVideos();
+    if (!videos.length) return null;
+
+    const visibleVideos = videos.filter(isInViewport);
+    const candidates = visibleVideos.length ? visibleVideos : videos;
+    candidates.sort((a, b) => videoCenterDistance(a) - videoCenterDistance(b));
+    return candidates[0] || null;
+  }
+
+  function findNextVideo(current){
+    const videos = getVideos().sort((a, b) => {
+      return a.getBoundingClientRect().top - b.getBoundingClientRect().top;
+    });
+
+    if (!videos.length) return null;
+    if (!current) return videos[0];
+
+    const currentRect = current.getBoundingClientRect();
+    const currentCenter = (currentRect.top + currentRect.bottom) / 2;
+
+    for (const video of videos){
+      if (video === current) continue;
+      const rect = video.getBoundingClientRect();
+      const center = (rect.top + rect.bottom) / 2;
+      if (center > currentCenter + 30) return video;
+    }
+
+    const index = videos.indexOf(current);
+    return index >= 0 ? videos[index + 1] || null : null;
+  }
+
+  function getScrollableParent(el){
+    let node = el && el.parentElement;
+    while (node && node !== document.body && node !== document.documentElement){
+      try {
+        const style = window.getComputedStyle(node);
+        const overflowY = style.overflowY;
+        if ((overflowY === 'auto' || overflowY === 'scroll') && node.scrollHeight > node.clientHeight + 20){
+          return node;
+        }
+      } catch (e) {}
+      node = node.parentElement;
+    }
+    return document.scrollingElement || document.documentElement;
+  }
+
+  function playSoon(video){
+    if (!video) return;
+    window.setTimeout(() => {
+      try {
+        const playResult = video.play();
+        if (playResult && playResult.catch) playResult.catch(() => {});
+      } catch (e) {}
+    }, 650);
+  }
+
+  function scrollPast(current, reason){
+    if (!enabled) return;
+
     const now = Date.now();
-    if (now - lastHandling < 500) return; // debounce
-    if (now < skipCooldownUntil) return; // temporary cooldown after a programmatic skip
-    lastHandling = now;
-
-    const current = e && e.target ? e.target : findFocusedVideo();
-    log('onVideoEnded triggered', e && e.type, 'current?', !!current);
-    if (!current) return;
-    try{ log('current state', {currentTime: current.currentTime, duration: current.duration, paused: current.paused}); } catch(err){}
-
-    if (e && e.type === 'timeupdate'){
-      try{
-        if (!(current.duration && current.currentTime && (current.duration - current.currentTime < 0.25))) return;
-      } catch(err){}
-    }
-
-    if (detectAdNearby(current)){
-      log('Ad detected on current video, skipping to next');
-    }
+    if (now < skipCooldownUntil || now - lastSkipAt < 500) return;
+    lastSkipAt = now;
+    skipCooldownUntil = now + 1300;
 
     const next = findNextVideo(current);
-    if (!next) return;
-    log('Scrolling to next video', next);
-    try {
-      next.scrollIntoView({behavior: 'smooth', block: 'center'});
-    } catch(e){
-      window.scrollTo({top: next.getBoundingClientRect().top + window.scrollY - 100, behavior:'smooth'});
+    log('Skipping Reel', reason, next ? 'with next video' : 'with fallback scroll');
+
+    if (next){
+      try {
+        next.scrollIntoView({behavior: 'smooth', block: 'center'});
+      } catch (e) {
+        const rect = next.getBoundingClientRect();
+        window.scrollTo({top: rect.top + window.scrollY - 80, behavior: 'smooth'});
+      }
+      playSoon(next);
+      return;
     }
 
-    skipCooldownUntil = Date.now() + 1400;
+    const scroller = getScrollableParent(current);
+    const amount = Math.max(window.innerHeight * 0.85, 480);
+    try {
+      if (scroller === document.scrollingElement || scroller === document.documentElement || scroller === document.body){
+        window.scrollBy({top: amount, behavior: 'smooth'});
+      } else {
+        scroller.scrollBy({top: Math.max(scroller.clientHeight * 0.85, 480), behavior: 'smooth'});
+      }
+    } catch (e) {
+      window.scrollBy(0, amount);
+    }
+  }
 
-    setTimeout(() => {
+  function eventVideoIsFocused(video){
+    const focused = findFocusedVideo();
+    if (!focused || !video) return false;
+    if (focused === video) return true;
+    return videoCenterDistance(video) < Math.max(window.innerHeight * 0.25, 180);
+  }
+
+  function onVideoEnded(event){
+    const video = event && event.target ? event.target : findFocusedVideo();
+    if (!video || !eventVideoIsFocused(video)) return;
+
+    if (event && event.type === 'timeupdate'){
       try {
-        next.muted = false;
-        const p = next.play();
-        if (p && p.catch) p.catch(() => {});
-      } catch(e){}
-    }, 600);
+        if (!video.duration || !video.currentTime || video.duration - video.currentTime > 0.25) return;
+      } catch (e) {
+        return;
+      }
+    }
+
+    scrollPast(video, event && event.type ? event.type : 'ended');
   }
 
-  function attachToAllExisting(){
-    const vids = getAllVideos();
-    vids.forEach(attachEndedListener);
+  function attachVideo(video){
+    if (!video || attachedVideos.has(video)) return;
+
+    function onTimeUpdate(){
+      onVideoEnded({target: video, type: 'timeupdate'});
+    }
+
+    video.addEventListener('ended', onVideoEnded);
+    video.addEventListener('timeupdate', onTimeUpdate);
+    attachedVideos.add(video);
+    cleanupByVideo.set(video, () => {
+      try { video.removeEventListener('ended', onVideoEnded); } catch (e) {}
+      try { video.removeEventListener('timeupdate', onTimeUpdate); } catch (e) {}
+    });
   }
 
-  function observeNewVideos(){
-    if (observer) return;
-    observer = new MutationObserver((mutations) => {
-      for (const m of mutations){
-        if (m.addedNodes && m.addedNodes.length){
-          m.addedNodes.forEach(node => {
-            if (node.nodeType !== Node.ELEMENT_NODE) return;
-            if (node.tagName && node.tagName.toLowerCase() === 'video') attachEndedListener(node);
-            const videos = node.querySelectorAll && node.querySelectorAll('video');
-            if (videos && videos.length) videos.forEach(attachEndedListener);
+  function detachAllVideos(){
+    attachedVideos.forEach((video) => {
+      const cleanup = cleanupByVideo.get(video);
+      if (cleanup) cleanup();
+    });
+    attachedVideos.clear();
+  }
 
-            try {
-              const focused = findFocusedVideo();
-              if (!focused) return;
-              const frect = focused.getBoundingClientRect();
-              if (isAdElement(node, frect)) {
-                try {
-                  const nrect = node.getBoundingClientRect();
-                  const ix = Math.max(0, Math.min(nrect.right, frect.right) - Math.max(nrect.left, frect.left));
-                  const iy = Math.max(0, Math.min(nrect.bottom, frect.bottom) - Math.max(nrect.top, frect.top));
-                  const interArea = ix * iy;
-                  const focusedArea = (frect.width * frect.height) || 1;
-                  if (interArea > focusedArea * 0.02 || node.contains(focused) || node === focused || (node.closest && node.closest('video') === focused)) {
-                    onVideoEnded({target: focused, type: 'ad'});
-                  }
-                } catch(e){}
-              }
-            } catch(e){}
-          });
+  function attachExistingVideos(){
+    if (!isReelsPage()){
+      detachAllVideos();
+      return;
+    }
+
+    getVideos().forEach(attachVideo);
+  }
+
+  function shouldScanRoot(el, searchRect){
+    if (!isElementVisible(el)) return false;
+    if (el === document.body || el === document.documentElement) return false;
+
+    const rect = el.getBoundingClientRect();
+    if (!rectsIntersect(rect, searchRect)) return false;
+
+    const viewportArea = Math.max(1, window.innerWidth * window.innerHeight);
+    return rectArea(rect) < viewportArea * 0.98;
+  }
+
+  function hasSponsoredLabel(el, searchRect){
+    if (!isElementVisible(el)) return false;
+
+    const rect = el.getBoundingClientRect();
+    if (!rectsIntersect(rect, searchRect)) return false;
+
+    if (textHasSponsoredSignal(el.getAttribute && el.getAttribute('aria-label'))) return true;
+    if (textHasSponsoredSignal(el.getAttribute && el.getAttribute('title'))) return true;
+    if (textHasSponsoredSignal(el.getAttribute && el.getAttribute('alt'))) return true;
+
+    const text = normalizeText(el.innerText || el.textContent);
+    return textHasSponsoredSignal(text);
+  }
+
+  function rootHasSponsoredLabel(root, searchRect){
+    if (!shouldScanRoot(root, searchRect)) return false;
+    if (hasSponsoredLabel(root, searchRect)) return true;
+    if (!root.querySelectorAll) return false;
+
+    let candidates;
+    try {
+      candidates = root.querySelectorAll('span, div, a, button, [aria-label], [title], [alt]');
+    } catch (e) {
+      return false;
+    }
+
+    const limit = Math.min(candidates.length, 160);
+    for (let i = 0; i < limit; i++){
+      if (hasSponsoredLabel(candidates[i], searchRect)) return true;
+    }
+
+    return false;
+  }
+
+  function detectSponsoredNearby(video){
+    if (!video || !isReelsPage()) return false;
+
+    const videoRect = video.getBoundingClientRect();
+    const searchRect = expandRect(videoRect, Math.min(360, window.innerWidth * 0.28), 140);
+    const samplePoints = [
+      {x: videoRect.left + videoRect.width * 0.5, y: videoRect.top + videoRect.height * 0.16},
+      {x: videoRect.left + videoRect.width * 0.5, y: videoRect.top + videoRect.height * 0.5},
+      {x: videoRect.left + videoRect.width * 0.5, y: videoRect.top + videoRect.height * 0.84},
+      {x: videoRect.left + videoRect.width * 0.22, y: videoRect.top + videoRect.height * 0.84},
+      {x: videoRect.left + videoRect.width * 0.78, y: videoRect.top + videoRect.height * 0.84}
+    ];
+
+    for (const point of samplePoints){
+      if (point.x < 0 || point.y < 0 || point.x > window.innerWidth || point.y > window.innerHeight) continue;
+
+      let elements = [];
+      try {
+        elements = document.elementsFromPoint(point.x, point.y);
+      } catch (e) {}
+
+      for (const el of elements){
+        let node = el;
+        for (let depth = 0; depth < 8 && node; depth++){
+          if (rootHasSponsoredLabel(node, searchRect)) return true;
+          node = node.parentElement;
         }
       }
-    });
-    observer.observe(document.body, {childList: true, subtree: true});
+    }
+
+    let node = video;
+    for (let depth = 0; depth < 8 && node; depth++){
+      if (rootHasSponsoredLabel(node, searchRect)) return true;
+      node = node.parentElement;
+    }
+
+    return false;
   }
 
-  function checkFocusedForAd(){
+  function skipSponsoredIfFocused(){
     const focused = findFocusedVideo();
     if (!focused) return;
-    try{
-      if (detectAdNearby(focused)){
-        setTimeout(() => onVideoEnded({target: focused, type: 'ad'}), 200);
-      }
-    } catch(e){}
+
+    if (detectSponsoredNearby(focused)){
+      scrollPast(focused, 'sponsored');
+    }
+  }
+
+  function syncReelsPage(){
+    if (!enabled) return;
+    observePage();
+    attachExistingVideos();
+    if (isReelsPage()) skipSponsoredIfFocused();
+  }
+
+  function observePage(){
+    if (observer || !document.body) return;
+
+    observer = new MutationObserver(() => {
+      window.setTimeout(syncReelsPage, 50);
+    });
+    observer.observe(document.body, {childList: true, subtree: true});
   }
 
   function start(){
     if (enabled) return;
     enabled = true;
-    attachToAllExisting();
-    observeNewVideos();
-    adCheckInterval = setInterval(checkFocusedForAd, 800);
-    log('ReelScroller enabled');
+
+    if (!document.body){
+      window.setTimeout(syncReelsPage, 250);
+    } else {
+      observePage();
+      syncReelsPage();
+    }
+
+    if (!syncInterval){
+      syncInterval = window.setInterval(syncReelsPage, 800);
+    }
+
+    log('enabled');
   }
 
   function stop(){
     if (!enabled) return;
     enabled = false;
-    if (observer){ observer.disconnect(); observer = null; }
-    if (adCheckInterval){ clearInterval(adCheckInterval); adCheckInterval = null; }
-    detachAll();
-    log('ReelScroller disabled');
+
+    if (observer){
+      observer.disconnect();
+      observer = null;
+    }
+
+    if (syncInterval){
+      window.clearInterval(syncInterval);
+      syncInterval = null;
+    }
+
+    detachAllVideos();
+    log('disabled');
   }
 
+  function applyEnabled(value){
+    if (value) start();
+    else stop();
+  }
+
+  function initFromStorage(){
+    try {
+      chrome.storage.local.get([ENABLED_KEY], (res) => {
+        if (chrome.runtime.lastError){
+          console.warn('[ReelScroller] storage read failed', chrome.runtime.lastError.message);
+          applyEnabled(true);
+          return;
+        }
+
+        const hasValue = Object.prototype.hasOwnProperty.call(res, ENABLED_KEY);
+        applyEnabled(hasValue ? res[ENABLED_KEY] !== false : true);
+      });
+    } catch (e) {
+      applyEnabled(true);
+    }
+  }
+
+  const controller = {
+    start,
+    stop,
+    initFromStorage,
+    applyEnabled
+  };
+
+  window[CONTROLLER_KEY] = controller;
+
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    if (!msg || !msg.type) return;
-    if (msg.type === 'ENABLE') start();
-    if (msg.type === 'DISABLE') stop();
+    if (!msg || !msg.type) return false;
+
+    if (msg.type === 'PING'){
+      if (sendResponse) sendResponse({ok: true, enabled});
+      return true;
+    }
+
+    if (msg.type === 'ENABLE'){
+      start();
+      if (sendResponse) sendResponse({ok: true, enabled: true});
+      return true;
+    }
+
+    if (msg.type === 'DISABLE'){
+      stop();
+      if (sendResponse) sendResponse({ok: true, enabled: false});
+      return true;
+    }
+
+    return false;
   });
 
-  // Start by default when the content script is injected so listeners are active for SPA navigation
-  try{ start(); log('content script loaded and started'); } catch(e){}
+  try {
+    chrome.storage.onChanged.addListener((changes, areaName) => {
+      if (areaName !== 'local' || !changes || !changes[ENABLED_KEY]) return;
+      applyEnabled(changes[ENABLED_KEY].newValue !== false);
+    });
+  } catch (e) {}
 
+  initFromStorage();
 })();
