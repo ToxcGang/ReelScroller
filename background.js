@@ -1,126 +1,127 @@
-// Background script: manages per-tab enabled state and toolbar toggle (MV2-compatible)
+// Background script: global toolbar toggle and Instagram tab coordination.
 
 console.log('[ReelScroller - background] loaded');
 
-// Ping instagram tabs to see if content script is present
-function pingInstagramTabs(){
-  chrome.tabs.query({}, (tabs) => {
-    if (!tabs || !tabs.length) return;
-    tabs.forEach(tab => {
-      if (!tab || !tab.url || !tab.id) return;
-      if (!tab.url.includes('instagram.com')) return;
-      chrome.tabs.sendMessage(tab.id, {type: 'PING'}, () => {
-        if (chrome.runtime.lastError){
-          console.log('[ReelScroller] no content script in tab', tab.id, chrome.runtime.lastError.message);
-        } else {
-          console.log('[ReelScroller] content script present in tab', tab.id);
-        }
-      });
-    });
+const ENABLED_KEY = 'reelScrollerEnabled';
+
+function isInstagramUrl(url){
+  if (typeof url !== 'string') return false;
+  try {
+    const parsed = new URL(url);
+    return parsed.hostname === 'instagram.com' || parsed.hostname.endsWith('.instagram.com');
+  } catch (e) {
+    return url.includes('instagram.com');
+  }
+}
+
+function getEnabled(callback){
+  chrome.storage.local.get([ENABLED_KEY], (res) => {
+    if (chrome.runtime.lastError){
+      console.warn('[ReelScroller] storage read failed', chrome.runtime.lastError.message);
+      callback(true);
+      return;
+    }
+
+    const hasValue = Object.prototype.hasOwnProperty.call(res, ENABLED_KEY);
+    callback(hasValue ? res[ENABLED_KEY] !== false : true);
   });
 }
 
-// run once at startup
-try{ pingInstagramTabs(); } catch(e) { console.warn('[ReelScroller] ping failed', e); }
+function setEnabled(enabled, callback){
+  const value = !!enabled;
+  const data = {};
+  data[ENABLED_KEY] = value;
 
-const storageKey = (tabId) => String(tabId);
+  chrome.storage.local.set(data, () => {
+    if (chrome.runtime.lastError){
+      console.warn('[ReelScroller] storage write failed', chrome.runtime.lastError.message);
+    }
+    updateToolbar(value);
+    if (callback) callback(value);
+  });
+}
 
-function setEnabledForTab(tabId, enabled){
-  const obj = {};
-  obj[storageKey(tabId)] = enabled;
-  chrome.storage.local.set(obj);
+function updateToolbar(enabled){
   try {
-    chrome.browserAction.setBadgeText({text: enabled ? 'ON' : '', tabId});
+    chrome.browserAction.setBadgeText({text: enabled ? 'ON' : ''});
+    chrome.browserAction.setBadgeBackgroundColor({color: enabled ? '#2e7d32' : '#666666'});
+    chrome.browserAction.setTitle({title: `Reel Scroller: ${enabled ? 'On' : 'Off'}`});
   } catch (e) {
-    // ignore
+    // Browser action APIs can be unavailable during extension startup in some contexts.
   }
 }
 
 function injectContentScript(tabId, callback){
-  try{
+  try {
     chrome.tabs.executeScript(tabId, {file: 'content_script_clean.js'}, () => {
       if (chrome.runtime.lastError){
-        console.warn('[ReelScroller] inject error', chrome.runtime.lastError.message);
-      } else {
-        console.log('[ReelScroller] injected content_script into tab', tabId);
+        console.warn('[ReelScroller] content script inject failed', chrome.runtime.lastError.message);
       }
       if (callback) callback();
     });
-  } catch(e){
-    console.warn('[ReelScroller] inject exception', e);
+  } catch (e) {
+    console.warn('[ReelScroller] content script inject exception', e);
     if (callback) callback();
   }
 }
 
-chrome.browserAction.onClicked.addListener((tab) => {
-  const tabId = tab.id;
-  injectContentScript(tabId, () => {
-    chrome.storage.local.get([storageKey(tabId)], (res) => {
-      const currently = !!res[storageKey(tabId)];
-      const next = !currently;
-      setEnabledForTab(tabId, next);
-      chrome.tabs.sendMessage(tabId, {type: next ? 'ENABLE' : 'DISABLE'}, () => {
-        if (chrome.runtime.lastError) {
-          // console.warn('sendMessage error', chrome.runtime.lastError);
-        }
+function sendStateToTab(tabId, enabled){
+  chrome.tabs.sendMessage(tabId, {type: enabled ? 'ENABLE' : 'DISABLE'}, () => {
+    if (chrome.runtime.lastError){
+      // Existing tabs may not have the content script yet. Inject once, then retry.
+      injectContentScript(tabId, () => {
+        chrome.tabs.sendMessage(tabId, {type: enabled ? 'ENABLE' : 'DISABLE'}, () => {
+          if (chrome.runtime.lastError){
+            console.warn('[ReelScroller] state message failed', chrome.runtime.lastError.message);
+          }
+        });
       });
-    });
+    }
   });
-});
-
-function isInstagramUrl(url){
-  return typeof url === 'string' && url.includes('instagram.com');
 }
 
-// When a tab finishes loading, inject content script and enable by default if no preference exists
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (changeInfo.status === 'complete' && isInstagramUrl(tab && tab.url)){
-    injectContentScript(tabId, () => {
-      chrome.storage.local.get([storageKey(tabId)], (res) => {
-        const val = res.hasOwnProperty(storageKey(tabId)) ? res[storageKey(tabId)] : undefined;
-        if (val === undefined){
-          // default ON
-          setEnabledForTab(tabId, true);
-          chrome.tabs.sendMessage(tabId, {type: 'ENABLE'}, () => {});
-        } else if (val){
-          chrome.tabs.sendMessage(tabId, {type: 'ENABLE'}, () => {});
-        }
-      });
+function applyStateToInstagramTabs(enabled){
+  chrome.tabs.query({}, (tabs) => {
+    if (!tabs || !tabs.length) return;
+    tabs.forEach((tab) => {
+      if (!tab || typeof tab.id !== 'number' || !isInstagramUrl(tab.url)) return;
+      sendStateToTab(tab.id, enabled);
     });
-  }
-});
+  });
+}
 
-// When a new tab is created, inject and set default ON for instagram pages
-chrome.tabs.onCreated.addListener((tab) => {
-  if (isInstagramUrl(tab && tab.url)){
-    injectContentScript(tab.id, () => {
-      chrome.storage.local.get([storageKey(tab.id)], (res) => {
-        if (!res.hasOwnProperty(storageKey(tab.id))){
-          setEnabledForTab(tab.id, true);
-          chrome.tabs.sendMessage(tab.id, {type: 'ENABLE'}, () => {});
-        }
-      });
-    });
-  }
-});
-
-// Initial scan (in case the extension is reloaded) - inject & enable for existing Instagram tabs if no preference
-chrome.tabs.query({}, (tabs) => {
-  if (!tabs || !tabs.length) return;
-  tabs.forEach(tab => {
-    if (!isInstagramUrl(tab.url)) return;
-    injectContentScript(tab.id, () => {
-      chrome.storage.local.get([storageKey(tab.id)], (res) => {
-        if (!res.hasOwnProperty(storageKey(tab.id))){
-          setEnabledForTab(tab.id, true);
-          chrome.tabs.sendMessage(tab.id, {type: 'ENABLE'}, () => {});
-        }
-      });
+chrome.browserAction.onClicked.addListener(() => {
+  getEnabled((currentlyEnabled) => {
+    setEnabled(!currentlyEnabled, (nextEnabled) => {
+      applyStateToInstagramTabs(nextEnabled);
     });
   });
 });
 
-// Clean up storage when tab is removed
-chrome.tabs.onRemoved.addListener((tabId) => {
-  chrome.storage.local.remove([storageKey(tabId)]);
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status !== 'complete' || !isInstagramUrl(tab && tab.url)) return;
+
+  getEnabled((enabled) => {
+    updateToolbar(enabled);
+    sendStateToTab(tabId, enabled);
+  });
+});
+
+chrome.runtime.onInstalled.addListener(() => {
+  getEnabled((enabled) => {
+    updateToolbar(enabled);
+    applyStateToInstagramTabs(enabled);
+  });
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  getEnabled((enabled) => {
+    updateToolbar(enabled);
+    applyStateToInstagramTabs(enabled);
+  });
+});
+
+getEnabled((enabled) => {
+  updateToolbar(enabled);
+  applyStateToInstagramTabs(enabled);
 });
