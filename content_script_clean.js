@@ -5,6 +5,7 @@
   const CONTROLLER_KEY = '__reelScrollerController';
   const ENABLED_KEY = 'reelScrollerEnabled';
   const SPONSORED_LABEL_RE = /\b(sponsored|paid partnership|paid promotion|advertisement)\b/i;
+  const EXACT_AD_LABEL_RE = /^ad$/i;
 
   if (window[CONTROLLER_KEY]){
     window[CONTROLLER_KEY].initFromStorage();
@@ -33,7 +34,9 @@
 
   function textHasSponsoredSignal(value){
     const text = normalizeText(value);
-    return text.length > 0 && text.length <= 100 && SPONSORED_LABEL_RE.test(text);
+    if (!text || text.length > 100) return false;
+    if (EXACT_AD_LABEL_RE.test(text)) return true;
+    return SPONSORED_LABEL_RE.test(text);
   }
 
   function rectArea(rect){
@@ -298,11 +301,40 @@
     return false;
   }
 
+  function scanVisibleSponsoredLabels(searchRect){
+    let candidates;
+    try {
+      candidates = document.querySelectorAll('span, a, button, [aria-label], [title], [alt]');
+    } catch (e) {
+      return false;
+    }
+
+    const limit = Math.min(candidates.length, 700);
+    for (let i = 0; i < limit; i++){
+      const el = candidates[i];
+      if (!isElementVisible(el)) continue;
+
+      let rect;
+      try {
+        rect = el.getBoundingClientRect();
+      } catch (e) {
+        continue;
+      }
+
+      if (!rectsIntersect(rect, searchRect)) continue;
+      if (hasSponsoredLabel(el, searchRect)) return true;
+    }
+
+    return false;
+  }
+
   function detectSponsoredNearby(video){
     if (!video || !isReelsPage()) return false;
 
     const videoRect = video.getBoundingClientRect();
     const searchRect = expandRect(videoRect, Math.min(360, window.innerWidth * 0.28), 140);
+    if (scanVisibleSponsoredLabels(searchRect)) return true;
+
     const samplePoints = [
       {x: videoRect.left + videoRect.width * 0.5, y: videoRect.top + videoRect.height * 0.16},
       {x: videoRect.left + videoRect.width * 0.5, y: videoRect.top + videoRect.height * 0.5},
