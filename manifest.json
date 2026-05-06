@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
   "name": "Reel Scroller (Instagram Auto-Scroll)",
-  "version": "0.1.1",
-  "description": "Automatically scroll Instagram Reels to the next one when the current video ends. Toggle with the toolbar button.",
+  "version": "0.2.0",
+  "description": "Automatically scroll Instagram Reels, skip sponsored Reels, and toggle globally from the toolbar.",
   "permissions": [
     "storage",
     "tabs",
