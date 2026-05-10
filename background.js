@@ -10,7 +10,7 @@ function isInstagramUrl(url){
     const parsed = new URL(url);
     return parsed.hostname === 'instagram.com' || parsed.hostname.endsWith('.instagram.com');
   } catch (e) {
-    return url.includes('instagram.com');
+    return false;
   }
 }
 
