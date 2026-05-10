@@ -6,7 +6,7 @@ Security updates are provided for the latest release of Reel Scroller and the cu
 
 | Version | Supported |
 |---------|-----------|
-| 0.2.1   | Yes       |
+| latest  | Yes       |
 | older   | No        |
 
 ## Reporting a Vulnerability
